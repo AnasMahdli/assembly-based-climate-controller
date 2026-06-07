@@ -1,0 +1,714 @@
+PROCESSOR 16F877A
+
+; --- CONFIGURATION BITS (RAW HEX) ---
+; 0x3F7A equals FOSC=HS, WDTE=OFF, LVP=OFF
+PSECT config, class=CONFIG, delta=2
+DW 0x3F7A ;=0011111101111010
+    ;edits configuration word register, 
+    ;PSECT=program selection, tells linker to stop normal exec and open new memory seg
+    ;class=CONFIG, notifies linker that content following this directive belongs to non-voltaile configuration memory space
+    ;compiler looks up the chip (pic16F877A) and automatically maps this section to physical hardware address (0x2007)
+    ;delta=2, memory addressdelta scale (2 bytes)
+    
+PSECT udata_shr, class=COMMON, space=1, noexec;reserve space in Shared Common RAM memory space
+w_temp:       DS 1			      ;udata_shr, standard name for uninitialized shared data memory space, this where the banks are and hence the "shared" term
+status_temp:  DS 1			      ;class=common, forces linker to place variables into the specialized memory range (0x70 to 0x7F)
+tick_count:   DS 1			      ;space=1, confirms the allocation is in data memory(RAM) and not program flash memory(space 0)
+sys_flags:    DS 1			      ;why? for ISR to read and write without needing BANKSEL instruction 
+sys_state:    DS 1
+
+;DS 1=define storage(1 byte)
+;w_temp, copies working register value temporarily until interrupt is serviced in order to not break operation
+;status_temp, same but with status register to not alter the flags(zero and carry)
+;tick_count, inc by 1 on each tick of 100ms of timer1 to recognize 1 second has passed
+;sys_flags, used as mask to signal background events between ISR and main loop
+;sys_state, day and night mode
+    
+    
+PSECT udata_bank0, class=BANK0, space=1, noexec;reserve space in General purpose RAM memory space
+delay_count:  DS 1			       ;PSECT udata_bank0, Creates a Program Section explicitly named for uninitialized data in Bank 0
+val_moist:    DS 1			       ;class=bank0, forces linker to place variables into the physical memory range (0x20 to 0x6F)
+val_hum:      DS 1			       ;noexec, tells compiler this cannot be executed as CPU instructions
+val_temp:     DS 1
+val_ldr:      DS 1
+math_scratch: DS 1
+lcd_tmp:      DS 1
+bcd_hun:      DS 1
+bcd_ten:      DS 1
+bcd_one:      DS 1
+lcd_delay:    DS 1
+limit_moist:  DS 1
+limit_temp:   DS 1
+limit_hum:    DS 1
+pump_timer:   DS 1
+ee_adr_temp:  DS 1
+ee_dat_temp:  DS 1
+
+PSECT vectors, class=CODE, delta=2, abs;system entry point, create program section called vectors to isolate system jump pointers
+ORG 0x0000			       ;class=code, informs linker this section contains executable instructions which must be programmed into flash memory
+_start:				       ;delta=2, memory address scale (2 bytes)
+    GOTO main			       ;abs, specifies permanent addresses that cannot be moved since linker has freedom to shuffle code blocks to optimize space
+				       ;ORG 0x0000, (origin)-sets memory address pointer for instructions beneath it, set to 0000 since Program Counter is forced to it upon reset
+ORG 0x0004			       ;_start, for linker to know where code begins
+				       
+				       ;main code too big to fit in 4 memory slots between reset vector and ISR vector (0x0000 & 0x0004) so, we write main after ISR and jump to it from address 0
+isr:
+    MOVWF w_temp		;copy W register into a safe RAM space
+    SWAPF 0x03, 0		;(swap nibbles in file) swap STATUS nubbles and move into W. why? to not affect any FLAGS like MOVF (0=save in acc., 1=overwrite original register)
+    MOVWF status_temp		;Save that safe STATUS copy into RAM
+
+    BCF 0x03, 5
+    BCF 0x03, 6			;bank 0
+    BTFSS 0x0C, 0		;(Bit Test File Skip if Set) tests bit 0 of PIR1 register(timer1 overflow)
+    GOTO ISR_EXIT		;if timer1 overflowed(100ms),timer1 was the one responsible for interrupt so go execute instructions
+
+    BCF 0x0C, 0			;if timer1 did not overflow,lower it's flag
+
+    MOVLW 0xCF
+    MOVWF 0x0F
+    MOVLW 0x2C
+    MOVWF 0x0E			;preload high(TMR1H=0Fh) and low(TMR1L=0Eh) byte of timer 1 to overflow at 100ms
+
+    BSF sys_flags, 0		;set bit 0 of sys_flags to 1 to execute 100ms routine
+
+    INCF tick_count, 1		;(Increment File, 0=store in working register, 1=overwrite register)
+    MOVLW 10
+    SUBWF tick_count, 0		;(Subtract W from File, 0=store in working register, 1=overwrite register)
+    
+    BTFSS 0x03, 2		;test bit 2(zero bit) of status register from result of above subtraction
+    GOTO ISR_EXIT		;if true(reached 10s), skip this line
+
+    CLRF tick_count		;(clear file), resets counter
+    
+    BSF sys_flags, 1		;set bit 1 of sys_flags to 1 to execute 1s routine
+
+ISR_EXIT:
+    SWAPF status_temp, 0	;reswap status nibbles and place into working register
+    MOVWF 0x03			;move from working register back to status register
+    SWAPF w_temp, 1		;swap working reg. temp storage and overwrite original one
+    SWAPF w_temp, 0		;reswap working reg. nibbles and send back to accumulator
+    RETFIE
+
+PSECT code, class=CODE, delta=2
+global main			;elevate "main" label from local bookmark to a global symbol across project
+
+main:
+    BSF 0x03, 5
+    BCF 0x03, 6			;goto bank1
+    BCF 0x87, 0	
+    BCF 0x87, 1			;0x87=TRISC(Port C Data Direction Register)
+    BCF 0x87, 2			;1=input, 0=output
+
+    BSF 0x85, 0			;0x85=TRISA(Port A Data Direction Register)
+    BSF 0x85, 1
+    BSF 0x85, 2
+    BSF 0x85, 3
+
+    MOVLW 0xFF
+    MOVWF 0x86			;0x86=TRISB(Port B Data Direction Register)
+
+    CLRF 0x88			;0x88=TRISD(Port D Data Direction Register)
+
+    MOVLW 0x00			;0x9F=ADCON1 register
+    MOVWF 0x9F			;set portA as analog, left justified conversion
+
+    MOVLW 0xFF
+    MOVWF 0x92			;0x92=PR2 (timer2 period register), set boundary resolution for PWM so Timer2 can count from 0 to 255 before resetting
+    
+    BCF 0x03, 5
+    BCF 0x03, 6			;goto bank0
+    MOVLW 0x06			
+    MOVWF 0x12			;0x12=T2CON, set timer2 prescaler and turn it on
+    
+    MOVLW 0x0C
+    MOVWF 0x17			;0x17=CCP1CON(Capture/Compare/PWMControl) register, set CCPx mode to PWM, this binds RC2 pin to timer2 counter
+    
+    MOVLW 0x0C
+    MOVWF 0x1D			;0x17=CCP1CON(Capture/Compare/PWMControl) register, set CCPx mode to PWM, this binds RC1 pin to timer2 counter
+
+    CLRF tick_count		;clear tick count to ensure it starts at 0
+    
+    CLRF sys_flags		;clear garbage data that might be in system flags
+
+    MOVLW 0x31
+    MOVWF 0x10			;0x10=T1CON register, set up background timing metronome
+
+    MOVLW 0xCF
+    MOVWF 0x0F
+    MOVLW 0x2C
+    MOVWF 0x0E			;preload high(TMR1H=0Fh) and low(TMR1L=0Eh) byte of timer 1 to overflow at 100ms
+
+    BSF 0x03, 5
+    BCF 0x03, 6			;goto to bank 1
+    BSF 0x8C, 0			;0x8C=PIE1 register(enable bits for peripheral interrupts), enable timer 1 overflow interrupt
+
+    CALL    DELAY_5MS		;lcd startup seq.
+    MOVLW   0x02		;enter LCD 4-bit data bus mode
+    CALL    LCD_CMD
+    MOVLW   0x28		;enable 2-line display interface and set font matrix size
+    CALL    LCD_CMD
+    MOVLW   0x0C		;turn LCD panel ON, hide blinking cursor amd disable cursor character flash
+    CALL    LCD_CMD
+    MOVLW   0x01		;clear display
+    CALL    LCD_CMD
+    CALL    DELAY_5MS		;LCD processor needs alot of time to clean registers, hard-set timer used to prevent sending of data between this register clearing
+    
+BOOT_EEPROM:
+    MOVLW   0x00		;EEPROM address for target soil moisture
+    CALL    EEPROM_READ
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   limit_moist		;copy retrieved data byte into application RAM variable
+    XORLW   0xFF		;check if EEPROM threshold is a set value and not default(1111)
+    BTFSS   0x03, 2		;if EEPROM has a set value(zero flag=0) then go to next line, otherwise skip
+    GOTO    FINISH_BOOT
+    
+    MOVLW   0x00
+    MOVWF   ee_adr_temp		;move target address into ee_adr_temp mailbox since EEPROM can only see it's own internal gateway registers
+    MOVLW   0x99
+    MOVWF   ee_dat_temp		;move safe moisture limit into ee_dat_temp mailbox
+    CALL    EEPROM_WRITE
+    
+    MOVLW   0x99		
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   limit_moist		;move safe moisture limit back into active RAM variable
+
+FINISH_BOOT:
+
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BSF 0x0B, 6
+    BSF 0x0B, 7			;0x0B=INTCON register, enable peripheral and global interrupts
+
+MAIN_LOOP:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSS sys_flags, 0		;sys_flags bit 0=100ms ready flag, if not set i.e. 100ms window not arrived yet then go to next line
+    GOTO CHECK_1SEC
+
+    BCF sys_flags, 0		;clear 100ms ready flag
+    CALL EXECUTE_100MS_TASKS
+
+CHECK_1SEC:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSS sys_flags, 1		;sys_flags bit 0=1s ready flag, if not set i.e. 1s not passed yet then go to next line
+    GOTO MAIN_LOOP
+
+    BCF sys_flags, 1		;1s has passed so lower flag and update
+    CALL EXECUTE_1SEC_TASKS
+    
+    GOTO MAIN_LOOP
+
+EXECUTE_100MS_TASKS:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVLW   0x41		;set ADCON0 configuration for A0 and clock scale
+    CALL    READ_ADC
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   val_moist		;move read value from working register to RAM
+
+    MOVLW   0x49
+    CALL    READ_ADC
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   val_hum
+    				;one by one read each sensor by modifying
+    MOVLW   0x51		;the ADCON register for each, reading
+    CALL    READ_ADC		;the value and moving it to RAM register
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   val_temp
+
+    MOVLW   0x59
+    CALL    READ_ADC
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   val_ldr
+
+CHECK_ESTOP_BTN:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSS   0x06, 7		;0x06= PORTB, check if ESTOP button is pressed(0) and go to SET_ESTOP if so
+    GOTO    SET_ESTOP
+    BTFSC   sys_flags, 4	;sys_flags bit 4= E-STOP flag, if set(button pressed) then go to END_100MS, otherwise go to EVAL_DAY_NIGHT
+    GOTO    END_100MS
+    GOTO    EVAL_DAY_NIGHT
+
+SET_ESTOP:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BSF     sys_flags, 4	;raise E-STOP flag if button is pressed
+    BCF     0x07, 0		;turn off pump
+    CLRF    0x15		;turn off fan by clearing its duty cycle
+    CLRF    0x1B		;turn off light by clearing its duty cycle
+    GOTO    END_100MS
+
+EVAL_DAY_NIGHT:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   sys_state, 0	;sys_state bit 0=Day(0)/Night(1) mode
+    GOTO    CHECK_DAY_TRANSITION
+
+CHECK_NIGHT_TRANSITION:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVLW   0x90		;load upper threshold limit
+    SUBWF   val_ldr, 0		;subtract threshold from LDR value
+    BTFSC   0x03, 0		;if subtraction result positive, carry=1
+    GOTO    SET_NIGHT
+    GOTO    LOGIC_PUMP		;if subtraction result negative, carry=0
+
+CHECK_DAY_TRANSITION:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVLW   0x70		;load lower threshold limit
+    SUBWF   val_ldr, 0		;subtract threshold from LDR value
+    BTFSS   0x03, 0		;if subtraction result negative, carry=0
+    GOTO    SET_DAY
+    GOTO    LOGIC_PUMP		;if subtraction result positive, carry=1
+
+SET_NIGHT:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BSF     sys_state, 0
+    GOTO    LOGIC_PUMP
+
+SET_DAY:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BCF     sys_state, 0
+
+LOGIC_PUMP:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   0x06, 4		;check if pump override button pressed(0)
+    GOTO    CHECK_ALARM
+
+MANUAL_OVERRIDE:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BCF     sys_flags, 2
+    BCF     sys_flags, 4	;clear system flags in case they are already triggered
+    CLRF    pump_timer		;reset dry-run timer back to 0
+    GOTO    PUMP_ON
+
+CHECK_ALARM:			;automatic mode
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   sys_flags, 2	;check dry-run flag, if triggered go to pump off
+    GOTO    PUMP_OFF
+
+PUMP_AUTO:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    limit_moist, 0
+    SUBWF   val_moist, 0	;subtract moisture limit from actual sensor value
+    BTFSC   0x03, 0		;sub result +(dry soil), carry=1 so go to Pump_On
+    GOTO    PUMP_ON
+    GOTO    PUMP_OFF		;sub result -(wet soil), carry=0 so go to Pump_Off
+
+PUMP_ON:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BSF     0x07, 0		
+    GOTO    LOGIC_LED
+
+PUMP_OFF:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BCF     0x07, 0
+
+LOGIC_LED:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   0x06, 5		;check if LED manual override ON(0), if so skip next line
+    GOTO    LED_AUTO        
+    MOVLW   0xFF            
+    MOVWF   0x1B		;set max pwm
+    GOTO    LOGIC_FAN
+
+LED_AUTO:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_ldr, 0
+    MOVWF   0x1B		;since brighter=lower LDR reading, LDR reading mapped directly to LED PWM
+
+LOGIC_FAN:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   0x06, 6		;check if FAN manual override ON(0), if so skip next line
+    GOTO    FAN_AUTO        
+    MOVLW   0xFF            
+    MOVWF   0x15		;set max pwm
+    GOTO    END_100MS
+
+FAN_AUTO:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   sys_state, 0	;check day/night mode
+    GOTO    FAN_NIGHT
+    GOTO    FAN_DAY
+
+FAN_DAY:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_temp, 0
+    ADDWF   val_temp, 0		;add W to File(0=store in W, 1=overrite register), multiply temperature by 2
+    BTFSC   0x03, 0		;carry=1 i.e. greater than 255, set as 255
+    MOVLW   0xFF
+    MOVWF   math_scratch	;temporary register to hold temperature value
+    GOTO    FAN_COMBINE
+
+FAN_NIGHT:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_temp, 0
+    MOVWF   math_scratch
+
+FAN_COMBINE:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_hum, 0
+    
+    ADDWF   math_scratch, 0	;add humidity and temperature
+    BTFSC   0x03, 0		;carry=1 i.e. greater than 255, set as 255
+    MOVLW   0xFF
+    MOVWF   0x15		;set pwm register to calculated value
+
+END_100MS:
+    RETURN
+
+EXECUTE_1SEC_TASKS:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSS   0x07, 0		;check if pump on, skip if so
+    GOTO    PUMP_IS_OFF
+    
+    INCF    pump_timer, 1
+    MOVLW   10
+    SUBWF   pump_timer, 0	
+    BTFSS   0x03, 0		;sub result +(>10s), carry=1 so skip next line
+    GOTO    LCD_BRANCH
+    
+    BSF     sys_flags, 2	;set dry-run flag ON
+    BCF     0x07, 0		;turn pump OFF
+    GOTO    LCD_BRANCH
+    
+PUMP_IS_OFF:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    CLRF    pump_timer
+
+LCD_BRANCH:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   sys_flags, 4	;check E-stop flag
+    GOTO    PRINT_ESTOP
+    BTFSC   sys_flags, 2	;check dry-run flag
+    GOTO    PRINT_ALARM
+    GOTO    NORMAL_LCD
+
+PRINT_ESTOP:
+    MOVLW   0x80
+    CALL    LCD_CMD
+    MOVLW   'E'
+    CALL    LCD_CHAR
+    MOVLW   '-'
+    CALL    LCD_CHAR
+    MOVLW   'S'
+    CALL    LCD_CHAR
+    MOVLW   'T'
+    CALL    LCD_CHAR
+    MOVLW   'O'
+    CALL    LCD_CHAR
+    MOVLW   'P'
+    CALL    LCD_CHAR
+    MOVLW   '!'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    GOTO    UPDATE_LINE_2
+
+NORMAL_LCD:
+    MOVLW   0x80
+    CALL    LCD_CMD
+    MOVLW   'M'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_moist, 0
+    CALL    PRINT_DECIMAL
+
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'T'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_temp, 0
+    CALL    PRINT_DECIMAL
+
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BTFSC   sys_state, 0
+    GOTO    PRINT_NIGHT
+    MOVLW   'D'
+    CALL    LCD_CHAR
+    GOTO    UPDATE_LINE_2
+
+PRINT_NIGHT:
+    MOVLW   'N'
+    CALL    LCD_CHAR
+    GOTO    UPDATE_LINE_2
+
+PRINT_ALARM:
+    MOVLW   0x80
+    CALL    LCD_CMD
+    MOVLW   'E'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    MOVLW   'D'
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   'Y'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'R'
+    CALL    LCD_CHAR
+    MOVLW   'U'
+    CALL    LCD_CHAR
+    MOVLW   'N'
+    CALL    LCD_CHAR
+    MOVLW   '!'
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   ' '
+    CALL    LCD_CHAR
+
+UPDATE_LINE_2:
+    MOVLW   0xC0
+    CALL    LCD_CMD
+    MOVLW   'F'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    0x15, 0
+    CALL    PRINT_DECIMAL
+
+    MOVLW   ' '
+    CALL    LCD_CHAR
+    MOVLW   'L'
+    CALL    LCD_CHAR
+    MOVLW   ':'
+    CALL    LCD_CHAR
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVF    val_ldr, 0
+    CALL    PRINT_DECIMAL
+
+    RETURN
+
+READ_ADC:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVWF   0x1F		;0x1F= ADCON0 
+    CALL    DELAY_20US      
+    BSF     0x1F, 2		;start ADC conversion
+WAIT_ADC:
+    BTFSC   0x1F, 2		;wait until conversion is over(bit=0)
+    GOTO    WAIT_ADC
+    MOVF    0x1E, 0		;(0=move to W register, 1=overwrite original register)
+    RETURN
+
+PRINT_DECIMAL:			;LCD BCD conversion
+    BCF 0x03, 5
+    BCF 0x03, 6
+    CLRF    bcd_hun
+    CLRF    bcd_ten
+    MOVWF   bcd_one         
+
+BCD_HUN_LOOP:
+    MOVLW   100
+    SUBWF   bcd_one, 0
+    BTFSS   0x03, 0		;subtract 100 and test, if >100 carry=1 and skip, else carry=0
+    GOTO    BCD_TEN_LOOP
+    MOVWF   bcd_one		;update value
+    INCF    bcd_hun, 1		;indicate hundred was found
+    GOTO    BCD_HUN_LOOP
+
+BCD_TEN_LOOP:
+    MOVLW   10
+    SUBWF   bcd_one, 0
+    BTFSS   0x03, 0		;subtract 10 and test, if >10 carry=1 and skip, else carry=0
+    GOTO    PRINT_DIGITS
+    MOVWF   bcd_one		;update value
+    INCF    bcd_ten, 1		;indicate ten was found
+    GOTO    BCD_TEN_LOOP	;loop until bcd_one<10
+
+PRINT_DIGITS:
+    MOVF    bcd_hun, 0
+    ADDLW   0x30		;add 0x30 to convert to hexa digits
+    CALL    LCD_CHAR
+    MOVF    bcd_ten, 0
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    MOVF    bcd_one, 0
+    ADDLW   0x30
+    CALL    LCD_CHAR
+    RETURN
+
+LCD_CMD:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BCF     0x08, 4		;0x08= PORTD, drive RS pin LOW for Command 
+    GOTO    LCD_WRITE
+
+LCD_CHAR:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    BSF     0x08, 4		;0x08= PORTD, drive RS pin HIGH for Data
+
+LCD_WRITE:
+    
+    MOVWF   lcd_tmp		;move character from W register to temporary register
+    
+    MOVLW   0xF0
+    ANDWF   0x08, 1		;Bitwise AND to save upper control pins(D4-D7) and clear lower pins(D0-D3)
+    SWAPF   lcd_tmp, 0		;swap high and low nibble 
+    ANDLW   0x0F		;remove high byte(now the low nibble)      
+    IORWF   0x08, 1		;Inclusive(Bitwise) OR W register with File register, combines the high byte(in low nibble) with control pin configuration
+    BSF     0x08, 5		;set enable pin High
+    CALL    DELAY_20US
+    BCF     0x08, 5		;latch data into LCD registers on falling edge
+    
+    MOVLW   0xF0
+    ANDWF   0x08, 1
+    MOVF    lcd_tmp, 0
+    ANDLW   0x0F            
+    IORWF   0x08, 1
+    BSF     0x08, 5
+    CALL    DELAY_20US
+    BCF     0x08, 5
+    
+    CALL    DELAY_20US      
+    RETURN
+
+DELAY_20US:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVLW   0x20
+    MOVWF   delay_count
+LOOP_D:
+    DECFSZ  delay_count, 1
+    GOTO    LOOP_D
+    RETURN
+
+DELAY_5MS:
+    BCF 0x03, 5
+    BCF 0x03, 6
+    MOVLW   0xC8            
+    MOVWF   lcd_delay
+LOOP_5MS:
+    CALL    DELAY_20US
+    DECFSZ  lcd_delay, 1
+    GOTO    LOOP_5MS
+    RETURN
+
+EEPROM_READ:
+    BCF 0x03, 5
+    BCF 0x03, 6			;bank0
+    MOVF    ee_adr_temp, 0
+    BCF 0x03, 5
+    BSF 0x03, 6			;bank1
+    MOVWF   0x10D		;move address index out of W into 0x10D(EEADR register) so EEPROM knows which slot to tap in to
+    BSF 0x03, 5
+    BSF 0x03, 6			;bank3
+    BCF     0x18C, 7		;0x18C = EECON1, set to access data memory
+    BSF     0x18C, 0		;initiate eeprom read
+    BCF 0x03, 5
+    BSF 0x03, 6			;bank2
+    MOVF    0x10C, 0		;0x10C = EEDATA, extract EEDATA to W
+    RETURN
+
+EEPROM_WRITE:
+    BCF 0x03, 5
+    BCF 0x03, 6			;BANK0
+    MOVF    ee_adr_temp, 0
+    
+    BCF 0x03, 5
+    BSF 0x03, 6			;BANK2
+    MOVWF   0x10D		;0x10D = EEADR, store target address(0x00)
+    			
+    BCF 0x03, 5
+    BCF 0x03, 6			;BANK0
+    MOVF    ee_dat_temp, 0
+    BCF 0x03, 5
+    BSF 0x03, 6
+    MOVWF   0x10C		;0x10C = EEDATA, store target data(0x99)
+    
+    BSF 0x03, 5
+    BSF 0x03, 6			;bank3
+    BCF     0x18C, 7		
+    BSF     0x18C, 2		;enable EEPROM write
+    
+    BCF 0x03, 5
+    BCF 0x03, 6			;bank0
+    BCF     0x0B, 7		;disable all global interrupts for precise clock synchronization
+    
+    BSF 0x03, 5
+    BSF 0x03, 6			;back to bank3
+    MOVLW   0x55
+    MOVWF   0x18D		;0x18D = EEPROM control register 2
+    MOVLW   0xAA		;by sending 0x55 followed by 0xAA immediately 
+    MOVWF   0x18D		;to EEPROM control 2, we tell the PIC to write to flash memory
+    
+    BSF     0x18C, 1		;EECON1 initiate write cycle
+EE_WAIT:
+    BTFSC   0x18C, 1		;check if write cycle finished, if so skip next line
+    GOTO    EE_WAIT
+    BCF     0x18C, 2		;disable EEPROM write
+    BCF 0x03, 5
+    BCF 0x03, 6			;bank0
+    BSF     0x0B, 7		;re-enable global interrupts
+    RETURN
+    
+END main
